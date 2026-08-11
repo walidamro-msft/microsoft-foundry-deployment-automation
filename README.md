@@ -185,7 +185,7 @@ azd up
 
 `.github/workflows/deploy-foundry.yml` implements:
 
-1. **validate** — `az deployment sub validate` for DEV/STG/PROD on pull requests and pushes to `main` (`fail-fast: false` so all three environments are checked even if one fails)
+1. **validate** — `az deployment sub validate` for DEV and DEV-STANDARD on pull requests and pushes to `main` (`fail-fast: false` so both are checked even if one fails). This repository targets the DEV subscription only; see the comment on the `validate` job in `deploy-foundry.yml` for how to add STG/PROD once their federated credentials exist
 2. **deploy-manual** — on-demand deployment to a chosen environment (`DEV`/`DEV-STANDARD`/`STG`/`PROD`/`PROD-SECONDARY-REGION`) via `workflow_dispatch`, with an optional `region` input to override the target Azure region without editing the `.bicepparam` file, and an optional `pruneOrphanedModels` input to delete model deployments that are no longer in the parameter file
 
 This is a deliberately simple pipeline: `validate` gives fast automatic feedback, and all real

@@ -46,14 +46,24 @@ concurrency:
 
 jobs:
   validate:
-    name: Validate Bicep - ${{ matrix.environment }}
+    name: Validate Bicep - ${{ matrix.name }}
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' || github.event_name == 'push'
+    # This repository targets the DEV subscription only. STG/PROD have no federated identity
+    # credentials configured, so validating them here fails at Azure login rather than on any
+    # real template problem. Add an entry below once an environment's credential exists.
+    # `githubEnvironment` is the GitHub Environment used for secrets/OIDC; `name` selects the
+    # parameter file (infra/<lowercased name>.main.bicepparam) -- DEV-STANDARD reuses DEV's
+    # credential, mirroring the mapping in the deploy-manual job.
     strategy:
       fail-fast: false
       matrix:
-        environment: [DEV, STG, PROD]
-    environment: ${{ matrix.environment }}
+        include:
+          - name: DEV
+            githubEnvironment: DEV
+          - name: DEV-STANDARD
+            githubEnvironment: DEV
+    environment: ${{ matrix.githubEnvironment }}
 
     steps:
       - name: Checkout code
@@ -75,7 +85,7 @@ jobs:
 
       - name: Set environment name to lowercase
         shell: bash
-        run: echo "ENV_LOWER=$(echo ${{ matrix.environment }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+        run: echo "ENV_LOWER=$(echo ${{ matrix.name }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
       - name: Ensure resource group exists
         shell: bash
@@ -101,7 +111,7 @@ jobs:
           APIGEE=$(echo "$P" | jq -r '.parameters.deployApigeeIntegration.value // false')
           ROLES=$(echo "$P" | jq -r '.parameters.deployRoleAssignments.value // false')
 
-          echo "::group::Deployment plan - ${{ matrix.environment }}"
+          echo "::group::Deployment plan - ${{ matrix.name }}"
           echo "Template:        ./infra/main.bicep"
           echo "Parameters file: $PARAM_FILE"
           echo "Region:          ${{ vars.AZURE_LOCATION || 'eastus' }}"

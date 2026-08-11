@@ -154,7 +154,7 @@ In repo **Settings → Environments**, create `DEV`, `STG`, `PROD` (and `PROD-SE
 
 | Stage | Trigger | Action |
 |---|---|---|
-| `validate` | PR to `main`, push to `main` | Ensures the resource group exists (`az group create`, idempotent), then `az deployment sub validate` across DEV/STG/PROD matrix |
+| `validate` | PR to `main`, push to `main` | Ensures the resource group exists (`az group create`, idempotent), then `az deployment sub validate` across the DEV and DEV-STANDARD matrix entries (both authenticate via the `DEV` GitHub Environment) |
 | `deploy-manual` | `workflow_dispatch` | Ensures the resource group exists (in the overridden region, if `region` input is set), then on-demand deploy to a chosen environment (`DEV`/`DEV-STANDARD`/`STG`/`PROD`/`PROD-SECONDARY-REGION`). The `.bicepparam` file is selected from the raw input (`infra/<lowercased-input>.main.bicepparam`), but the GitHub Environment used for secrets/OIDC is `DEV` for both `DEV` and `DEV-STANDARD`. After a successful deploy it reconciles model deployments (see §5.1) |
 
 This is intentionally a simple two-stage pipeline: `validate` gives fast feedback on every PR/push,
@@ -179,7 +179,7 @@ gh workflow run deploy-foundry.yml -f environment=PROD -f region=westus2
 
 1. Confirm availability: `az cognitiveservices model list --location <region>`.
 2. Add an entry to `foundryModelDeployments` in the target environment's `.bicepparam` file (see `docs/architecture.md` §5 for the schema).
-3. Open a PR — the `validate` stage confirms the change deploys cleanly (`az deployment sub validate`) across DEV/STG/PROD.
+3. Open a PR — the `validate` stage confirms the change deploys cleanly (`az deployment sub validate`) for DEV and DEV-STANDARD. Changes to `stg`/`prod` parameter files are **not** validated automatically (see §4.3).
 4. Use `deploy-manual` (Actions → Run workflow) to roll out the change to the desired environment(s) in order (DEV → STG → PROD).
 
 Adding a model is purely additive: the deployment runs in ARM **Incremental** mode, so the new
@@ -235,7 +235,7 @@ onboarding), see [`model-lifecycle-demo.md`](model-lifecycle-demo.md).
 1. Copy `infra/prod-secondary-region.main.bicepparam` to a new file (e.g., `infra/prod-<region>.main.bicepparam`).
 2. Update `location`, `resourceGroupName`, and all globally-unique resource names (`namePrefix` ≤ 10 chars, `kvName`, `storageName`, `cosmosDBName`, `aiSearchName` if Standard Agent Setup).
 3. Validate as in §3.2, then deploy via `az deployment sub create` or `deploy-manual` with the `region` input.
-4. Add the new `.bicepparam` filename to the pipeline if you want it included in the automated `validate` matrix (edit the `matrix.environment` list in `deploy-foundry.yml`).
+4. Add the new `.bicepparam` filename to the pipeline if you want it included in the automated `validate` matrix (add an entry to the `matrix.include` list in `deploy-foundry.yml`, with `name` matching the parameter filename and `githubEnvironment` set to a GitHub Environment that has a federated credential).
 5. Configure your API gateway / Front Door / Traffic Manager to route to the new region's `foundryEndpoint` output — this framework does not manage cross-region traffic steering (see `docs/architecture.md` §6).
 
 ## 7. Enabling Entra ID / Apigee Gateway Integration
@@ -262,3 +262,4 @@ onboarding), see [`model-lifecycle-demo.md`](model-lifecycle-demo.md).
 | Cosmos DB creation fails with `ServiceUnavailable`/high-demand error (Standard Agent Setup only) | Transient regional capacity shortage for new Cosmos DB accounts (independent of the `isZoneRedundant: false` setting already used by `modules/cosmosdb.bicep`). First, check for a stuck account left by the failed attempt (`az cosmosdb show --name <name> --resource-group <rg>` — if `provisioningState` is `Failed`, delete it with `az cosmosdb delete` before retrying, otherwise redeploy fails with `BadRequest`/"previous attempt to create it was not successful"). Then either retry later, or set the `cosmosDBLocation` parameter to a nearby region with available capacity (Cosmos DB connects to the Foundry project cross-region without issue) — see `dev.main.bicepparam` for an example. |
 | Model deployment fails with capacity/quota error | Check regional quota (`az cognitiveservices usage list --location <region>`) and request a quota increase if needed. Also check for orphaned deployments still holding quota (see next row). |
 | Model removed from `.bicepparam` still exists in Azure | Expected — ARM Incremental mode never deletes de-referenced resources. The pipeline's **Reconcile model deployments** step reports these as warnings; re-run `deploy-manual` with `pruneOrphanedModels` checked to delete them. See §5.1. |
+| `validate` job fails at "Azure Login (OIDC)" with `AADSTS700213` for an environment | That GitHub Environment has no matching federated identity credential. The `validate` matrix is intentionally limited to environments that do (see §4.3) — don't add an entry to `matrix.include` until the credential exists, or the gated build fails on authentication rather than on any template problem. Note the failure is unrelated to the Bicep: check whether the `Validate Bicep - DEV` job passed to confirm. |
