@@ -1,0 +1,154 @@
+name: Evaluate Models
+
+# Deeper model-quality validation, complementing the inference validation that runs inside
+# 'Deploy Microsoft Foundry'. Inference validation answers "does this deployment serve
+# traffic?"; this workflow answers "does it still return correct answers?" by running a
+# graded dataset through the Azure OpenAI Evals API.
+#
+# Dispatch-only by design: this repository deliberately avoids automatic, unattended runs
+# so that every execution is explicit and auditable.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to evaluate'
+        required: true
+        type: choice
+        options:
+          - DEV
+          - DEV-STANDARD
+          - STG
+          - PROD
+          - PROD-SECONDARY-REGION
+      deployments:
+        description: 'Space-separated model deployment names to evaluate. Leave blank to evaluate every chat deployment on the account.'
+        required: false
+        type: string
+      dataset:
+        description: 'Force one JSONL dataset for every deployment, overriding per-model files. Leave blank to use evaluations/<deployment>.jsonl.'
+        required: false
+        type: string
+        default: ''
+      passThreshold:
+        description: 'Fraction of dataset items a deployment must answer correctly to pass (0.0-1.0).'
+        required: false
+        type: string
+        default: '0.8'
+      keepEval:
+        description: 'Keep the evaluation definition in Azure after the run so results can be inspected in the portal. Normally deleted automatically.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: evaluate-models-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    name: Evaluate - ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    # DEV-STANDARD reuses the DEV GitHub Environment's secrets/federated credential (same
+    # subscription, same service principal) -- only the .bicepparam file differs.
+    environment:
+      name: ${{ github.event.inputs.environment == 'DEV-STANDARD' && 'DEV' || github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install/upgrade Bicep CLI (via az cli)
+        shell: bash
+        run: |
+          az bicep install
+          az bicep upgrade
+
+      - name: Set environment name to lowercase
+        shell: bash
+        run: echo "ENV_LOWER=$(echo ${{ github.event.inputs.environment }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Resolve target Foundry account
+        shell: bash
+        run: |
+          set -euo pipefail
+          PARAM_FILE="./infra/${{ env.ENV_LOWER }}.main.bicepparam"
+          if [ ! -f "$PARAM_FILE" ]; then
+            echo "::error::Parameter file '$PARAM_FILE' not found."
+            exit 1
+          fi
+
+          # Same resolution the deploy workflow uses: compile the .bicepparam so the account
+          # name comes from the single source of truth rather than being duplicated here.
+          PARAM_JSON=$(az bicep build-params --file "$PARAM_FILE" --stdout | jq -r '.parametersJson')
+          FOUNDRY_NAME=$(echo "$PARAM_JSON" | jq -r '.parameters.foundryName.value')
+          RG=$(grep -oP "(?<=param resourceGroupName = ')[^']+" "$PARAM_FILE")
+
+          echo "Foundry account: $FOUNDRY_NAME"
+          echo "Resource group:  $RG"
+          echo "FOUNDRY_NAME=$FOUNDRY_NAME" >> $GITHUB_ENV
+          echo "RESOURCE_GROUP=$RG" >> $GITHUB_ENV
+
+      - name: Run model evaluations
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARGS=(
+            --foundry-name "${{ env.FOUNDRY_NAME }}"
+            --resource-group "${{ env.RESOURCE_GROUP }}"
+            --pass-threshold "${{ github.event.inputs.passThreshold || '0.8' }}"
+          )
+
+          # Only pass --dataset when the caller supplied one: an empty value
+          # would otherwise force every model onto one dataset and defeat the
+          # per-model expected answers.
+          if [ -n "${{ github.event.inputs.dataset }}" ]; then
+            ARGS+=(--dataset "${{ github.event.inputs.dataset }}")
+          fi
+
+          # Repeatable --deployment flag; blank input means "evaluate everything".
+          for D in ${{ github.event.inputs.deployments }}; do
+            ARGS+=(--deployment "$D")
+          done
+
+          if [ "${{ github.event.inputs.keepEval }}" = "true" ]; then
+            ARGS+=(--keep-eval)
+          fi
+
+          python3 ./scripts/run-evaluations.py "${ARGS[@]}"
+
+      - name: Explain evaluation failure
+        shell: bash
+        if: failure()
+        run: |
+          {
+            echo "### Evaluation failed"
+            echo ""
+            echo "A model answered fewer questions correctly than the pass threshold allows, or the"
+            echo "evaluation could not run at all. Check the step log above for the per-deployment table."
+            echo ""
+            echo "Common causes:"
+            echo "- **A model version changed.** Re-pointing a deployment at a newer version can change"
+            echo "  answer formatting enough to fail an exact-match grader even when the model is healthy."
+            echo "  Update that model's \`evaluations/<deployment>.jsonl\` rather than lowering the threshold."
+            echo "- **Rate limiting (HTTP 429).** Reported explicitly as a quota problem, not a quality"
+            echo "  failure, and retried automatically. If it persists, the deployment needs more TPM."
+            echo "- **HTTP 401/403.** Evaluations are a *data-plane* operation. The deploy identity needs"
+            echo "  \`Cognitive Services OpenAI User\` on the account. That role is granted by"
+            echo "  \`infra/main.bicep\` during a deploy, so run **Deploy Microsoft Foundry** against this"
+            echo "  environment at least once before evaluating."
+            echo "- **A genuinely degraded model.** Re-run with \`keepEval\` enabled to inspect the"
+            echo "  per-item results in the Azure AI Foundry portal."
+          } >> "$GITHUB_STEP_SUMMARY"
